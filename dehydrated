@@ -17,7 +17,7 @@ umask 077 # paranoid umask, we're creating private keys
 exec 3>&-
 exec 4>&-
 
-VERSION="0.6.6"
+VERSION="0.7.1"
 
 # Find directory in which this script is stored by traversing all symbolic links
 SOURCE="${0}"
@@ -254,7 +254,10 @@ check_dependencies() {
 store_configvars() {
   __KEY_ALGO="${KEY_ALGO}"
   __OCSP_MUST_STAPLE="${OCSP_MUST_STAPLE}"
+  __OCSP_FETCH="${OCSP_FETCH}"
+  __OCSP_DAYS="${OCSP_DAYS}"
   __PRIVATE_KEY_RENEW="${PRIVATE_KEY_RENEW}"
+  __PRIVATE_KEY_ROLLOVER="${PRIVATE_KEY_ROLLOVER}"
   __KEYSIZE="${KEYSIZE}"
   __CHALLENGETYPE="${CHALLENGETYPE}"
   __HOOK="${HOOK}"
@@ -269,7 +272,10 @@ store_configvars() {
 reset_configvars() {
   KEY_ALGO="${__KEY_ALGO}"
   OCSP_MUST_STAPLE="${__OCSP_MUST_STAPLE}"
+  OCSP_FETCH="${__OCSP_FETCH}"
+  OCSP_DAYS="${__OCSP_DAYS}"
   PRIVATE_KEY_RENEW="${__PRIVATE_KEY_RENEW}"
+  PRIVATE_KEY_ROLLOVER="${__PRIVATE_KEY_ROLLOVER}"
   KEYSIZE="${__KEYSIZE}"
   CHALLENGETYPE="${__CHALLENGETYPE}"
   HOOK="${__HOOK}"
@@ -345,7 +351,7 @@ load_config() {
   WELLKNOWN=
   PRIVATE_KEY_RENEW="yes"
   PRIVATE_KEY_ROLLOVER="no"
-  KEY_ALGO=rsa
+  KEY_ALGO=secp384r1
   OPENSSL=openssl
   OPENSSL_CNF=
   CONTACT_EMAIL=
@@ -503,6 +509,7 @@ load_config() {
   [[ -n "${PARAM_NO_LOCK:-}" ]] && LOCKFILE=""
 
   [[ -n "${PARAM_HOOK:-}" ]] && HOOK="${PARAM_HOOK}"
+  [[ -n "${PARAM_DOMAINS_TXT:-}" ]] && DOMAINS_TXT="${PARAM_DOMAINS_TXT}"
   [[ -n "${PARAM_PREFERRED_CHAIN:-}" ]] && PREFERRED_CHAIN="${PARAM_PREFERRED_CHAIN}"
   [[ -n "${PARAM_CERTDIR:-}" ]] && CERTDIR="${PARAM_CERTDIR}"
   [[ -n "${PARAM_ALPNCERTDIR:-}" ]] && ALPNCERTDIR="${PARAM_ALPNCERTDIR}"
@@ -510,6 +517,10 @@ load_config() {
   [[ -n "${PARAM_KEY_ALGO:-}" ]] && KEY_ALGO="${PARAM_KEY_ALGO}"
   [[ -n "${PARAM_OCSP_MUST_STAPLE:-}" ]] && OCSP_MUST_STAPLE="${PARAM_OCSP_MUST_STAPLE}"
   [[ -n "${PARAM_IP_VERSION:-}" ]] && IP_VERSION="${PARAM_IP_VERSION}"
+
+  if [ "${PARAM_FORCE_VALIDATION:-no}" = "yes" ] && [ "${PARAM_FORCE:-no}" = "no" ]; then
+    _exiterr "Argument --force-validation can only be used in combination with --force (-x)"
+  fi
 
   if [ ! "${1:-}" = "noverify" ]; then
     verify_config
@@ -730,8 +741,10 @@ _sed() {
 
 # Print error message and exit with error
 _exiterr() {
-  echo "ERROR: ${1}" >&2
-  [[ "${skip_exit_hook:-no}" = "no" ]] && [[ -n "${HOOK:-}" ]] && ("${HOOK}" "exit_hook" "${1}" || echo 'exit_hook returned with non-zero exit code!' >&2)
+  if [ -n "${1:-}" ]; then
+    echo "ERROR: ${1}" >&2
+  fi
+  [[ "${skip_exit_hook:-no}" = "no" ]] && [[ -n "${HOOK:-}" ]] && ("${HOOK}" "exit_hook" "${1:-}" || echo 'exit_hook returned with non-zero exit code!' >&2)
   exit 1
 }
 
@@ -843,7 +856,7 @@ http_request() {
 
       # remove temporary domains.txt file if used
       [[ "${COMMAND:-}" = "sign_domains" && -n "${PARAM_DOMAIN:-}" && -n "${DOMAINS_TXT:-}" ]] && rm "${DOMAINS_TXT}"
-      exit 1
+      _exiterr
     fi
   fi
 
@@ -923,18 +936,14 @@ extract_altnames() {
     printf "%s" "${altnames}" | tr '\n' ' '
   else
     # No SANs, extract CN
-    altnames="$( <<<"${reqtext}" grep '^[[:space:]]*Subject:' | _sed -e 's/.* CN ?= ?([^ /,]*).*/\1/' )"
+    altnames="$( <<<"${reqtext}" grep '^[[:space:]]*Subject:' | _sed -e 's/.*[ /]CN ?= ?([^ /,]*).*/\1/' )"
     printf "%s" "${altnames}"
   fi
 }
 
-# Get last subject CN in certificate chain
+# Get last issuer CN in certificate chain
 get_last_cn() {
-  cn="$("${OPENSSL}" verify -CAfile <(echo "${1}") -show_chain <(echo "${1}") | tail -n 1 | _sed -e 's/.* CN ?= ?([^/,]*).*/\1/')"
-  if [ -z "${cn}" ]; then
-    _exiterr "Error while fetching CN from certificate chain"
-  fi
-  printf "${cn}"
+  <<<"${1}" _sed 'H;/-----BEGIN CERTIFICATE-----/h;$!d;x' | "${OPENSSL}" x509 -noout -issuer | head -n1 | _sed -e 's/.*[ /]CN ?= ?([^/,]*).*/\1/'
 }
 
 # Create certificate for domain(s) and outputs it FD 3
@@ -1011,9 +1020,13 @@ sign_csr() {
     fi
 
     # Check if authorization has already been validated
-    if [ "$(echo "${response}" | _sed 's/"challenges": \[\{.*\}\]//' | get_json_string_value status)" = "valid" ] && [ ! "${PARAM_FORCE:-no}" = "yes" ]; then
-      echo " + Found valid authorization for ${identifier}"
-      continue
+    if [ "$(echo "${response}" | get_json_string_value status)" = "valid" ]; then
+      if [ "${PARAM_FORCE_VALIDATION:-no}" = "yes" ]; then
+        echo " + A valid authorization has been found but will be ignored"
+      else
+        echo " + Found valid authorization for ${identifier}"
+        continue
+      fi
     fi
 
     # Find challenge in authorization
@@ -1053,7 +1066,7 @@ sign_csr() {
         keyauth_hook="$(printf '%s' "${keyauth}" | "${OPENSSL}" dgst -sha256 -binary | urlbase64)"
         ;;
       "tls-alpn-01")
-        keyauth_hook="$(printf '%s' "${keyauth}" | "${OPENSSL}" dgst -sha256 -c -hex | awk '{print $2}')"
+        keyauth_hook="$(printf '%s' "${keyauth}" | "${OPENSSL}" dgst -sha256 -c -hex | awk '{print $NF}')"
         generate_alpn_certificate "${identifier}" "${keyauth_hook}"
         ;;
     esac
@@ -1283,6 +1296,7 @@ generate_alpn_certificate() {
   SUBJ="/CN=${altname}/"
   [[ "${OSTYPE:0:5}" = "MINGW" ]] && SUBJ="/${SUBJ}"
   _openssl req -x509 -new -sha256 -nodes -newkey rsa:2048 -keyout "${alpncertdir}/${altname}.key.pem" -out "${alpncertdir}/${altname}.crt.pem" -subj "${SUBJ}" -extensions SAN -config "${tmp_openssl_cnf}"
+  chmod g+r "${alpncertdir}/${altname}.key.pem" "${alpncertdir}/${altname}.crt.pem"
   rm -f "${tmp_openssl_cnf}"
 }
 
@@ -1613,9 +1627,11 @@ command_sign_domains() {
         rm "${aftervars}"
       ); do
         config_var="$(echo "${cfgline:1}" | cut -d'=' -f1)"
-        config_value="$(echo "${cfgline:1}" | cut -d'=' -f2-)"
+        config_value="$(echo "${cfgline:1}" | cut -d'=' -f2- | tr -d "'")"
+	# All settings that are allowed here should also be stored and
+	# restored in store_configvars() and reset_configvars()
         case "${config_var}" in
-          KEY_ALGO|OCSP_MUST_STAPLE|PRIVATE_KEY_RENEW|PRIVATE_KEY_ROLLOVER|KEYSIZE|CHALLENGETYPE|HOOK|PREFERRED_CHAIN|WELLKNOWN|HOOK_CHAIN|OPENSSL_CNF|RENEW_DAYS)
+          KEY_ALGO|OCSP_MUST_STAPLE|OCSP_FETCH|OCSP_DAYS|PRIVATE_KEY_RENEW|PRIVATE_KEY_ROLLOVER|KEYSIZE|CHALLENGETYPE|HOOK|PREFERRED_CHAIN|WELLKNOWN|HOOK_CHAIN|OPENSSL_CNF|RENEW_DAYS)
             echo "   + ${config_var} = ${config_value}"
             declare -- "${config_var}=${config_value}"
             ;;
@@ -1715,7 +1731,7 @@ command_sign_domains() {
       if [[ "${update_ocsp}" = "yes" ]]; then
         echo " + Updating OCSP stapling file"
         ocsp_timestamp="$(date +%s)"
-        if grep -qE "^(0|(1\.0))\." <<< "$(${OPENSSL} version | awk '{print $2}')"; then
+        if grep -qE "^(openssl (0|(1\.0))\.)|(libressl (1|2|3)\.)" <<< "$(${OPENSSL} version | awk '{print tolower($0)}')"; then
           ocsp_log="$("${OPENSSL}" ocsp -no_nonce -issuer "${chain}" -verify_other "${chain}" -cert "${cert}" -respout "${certdir}/ocsp-${ocsp_timestamp}.der" -url "${ocsp_url}" -header "HOST" "$(echo "${ocsp_url}" | _sed -e 's/^http(s?):\/\///' -e 's/\/.*$//g')" 2>&1)" || _exiterr "Error while fetching OCSP information: ${ocsp_log}"
         else
           ocsp_log="$("${OPENSSL}" ocsp -no_nonce -issuer "${chain}" -verify_other "${chain}" -cert "${cert}" -respout "${certdir}/ocsp-${ocsp_timestamp}.der" -url "${ocsp_url}" 2>&1)" || _exiterr "Error while fetching OCSP information: ${ocsp_log}"
@@ -1858,9 +1874,11 @@ command_cleanup() {
     load_config
   fi
 
-  # Create global archive directory if not existent
-  if [[ ! -e "${BASEDIR}/archive" ]]; then
-    mkdir "${BASEDIR}/archive"
+  if [[ ! "${PARAM_CLEANUPDELETE:-}" = "yes" ]]; then
+    # Create global archive directory if not existent
+    if [[ ! -e "${BASEDIR}/archive" ]]; then
+      mkdir "${BASEDIR}/archive"
+    fi
   fi
 
   # Allow globbing
@@ -1875,18 +1893,26 @@ command_cleanup() {
     certname="$(basename "${certdir}")"
 
     # Create certificates archive directory if not existent
-    archivedir="${BASEDIR}/archive/${certname}"
-    if [[ ! -e "${archivedir}" ]]; then
-      mkdir "${archivedir}"
+    if [[ ! "${PARAM_CLEANUPDELETE:-}" = "yes" ]]; then
+      archivedir="${BASEDIR}/archive/${certname}"
+      if [[ ! -e "${archivedir}" ]]; then
+        mkdir "${archivedir}"
+      fi
     fi
 
     # Loop over file-types (certificates, keys, signing-requests, ...)
     for filetype in cert.csr cert.pem chain.pem fullchain.pem privkey.pem ocsp.der; do
-      # Skip if symlink is broken
-      [[ -r "${certdir}/${filetype}" ]] || continue
-
-      # Look up current file in use
-      current="$(basename "$(readlink "${certdir}/${filetype}")")"
+      # Delete all if symlink is broken
+      if [[ -r "${certdir}/${filetype}" ]]; then
+        # Look up current file in use
+        current="$(basename "$(readlink "${certdir}/${filetype}")")"
+      else
+        if [[ -h "${certdir}/${filetype}" ]]; then
+          echo "Removing broken symlink: ${certdir}/${filetype}"
+          rm -f "${certdir}/${filetype}"
+        fi
+        current=""
+      fi
 
       # Split filetype into name and extension
       filebase="$(echo "${filetype}" | cut -d. -f1)"
@@ -1896,9 +1922,15 @@ command_cleanup() {
       for file in "${certdir}/${filebase}-"*".${fileext}" "${certdir}/${filebase}-"*".${fileext}-revoked"; do
         # Check if current file is in use, if unused move to archive directory
         filename="$(basename "${file}")"
-        if [[ ! "${filename}" = "${current}" ]]; then
-          echo "Moving unused file to archive directory: ${certname}/${filename}"
-          mv "${certdir}/${filename}" "${archivedir}/${filename}"
+        if [[ ! "${filename}" = "${current}" ]] && [[ -f "${certdir}/${filename}" ]]; then
+          echo "${filename}"
+          if [[ "${PARAM_CLEANUPDELETE:-}" = "yes" ]]; then
+            echo "Deleting unused file: ${certname}/${filename}"
+            rm "${certdir}/${filename}"
+          else
+            echo "Moving unused file to archive directory: ${certname}/${filename}"
+            mv "${certdir}/${filename}" "${archivedir}/${filename}"
+          fi
         fi
       done
     done
@@ -1906,6 +1938,13 @@ command_cleanup() {
 
   exit "${exit_with_errorcode}"
 }
+
+# Usage: --cleanup-delete (-gcd)
+# Description: Deletes (!) unused certificate files
+command_cleanupdelete() {
+  command_cleanup
+}
+
 
 # Usage: --help (-h)
 # Description: Show help text
@@ -2019,6 +2058,11 @@ main() {
         set_command cleanup
         ;;
 
+      --cleanup-delete|-gcd)
+        set_command cleanupdelete
+        PARAM_CLEANUPDELETE="yes"
+        ;;
+
       # PARAM_Usage: --full-chain (-fc)
       # PARAM_Description: Print full chain when using --signcsr
       --full-chain|-fc)
@@ -2079,6 +2123,12 @@ main() {
         PARAM_FORCE="yes"
         ;;
 
+      # PARAM_Usage: --force-validation
+      # PARAM_Description: Force revalidation of domain names (used in combination with --force)
+      --force-validation)
+        PARAM_FORCE_VALIDATION="yes"
+        ;;
+
       # PARAM_Usage: --no-lock (-n)
       # PARAM_Description: Don't use lockfile (potentially dangerous!)
       --no-lock|-n)
@@ -2105,6 +2155,14 @@ main() {
         shift 1
         check_parameters "${1:-}"
         PARAM_ACCOUNT_KEY="${1}"
+        ;;
+
+      # PARAM_Usage: --domains-txt path/to/domains.txt
+      # PARAM_Description: Use specified domains.txt instead of default/configured one
+      --domains-txt)
+        shift 1
+        check_parameters "${1:-}"
+        PARAM_DOMAINS_TXT="${1}"
         ;;
 
       # PARAM_Usage: --config (-f) path/to/config
@@ -2147,8 +2205,8 @@ main() {
         PARAM_ALPNCERTDIR="${1}"
         ;;
 
-      # PARAM_Usage: --challenge (-t) http-01|dns-01
-      # PARAM_Description: Which challenge should be used? Currently http-01 and dns-01 are supported
+      # PARAM_Usage: --challenge (-t) http-01|dns-01|tls-alpn-01
+      # PARAM_Description: Which challenge should be used? Currently http-01, dns-01, and tls-alpn-01 are supported
       --challenge|-t)
         shift 1
         check_parameters "${1:-}"
@@ -2183,6 +2241,7 @@ main() {
     deactivate) command_deactivate;;
     cleanup) command_cleanup;;
     terms) command_terms;;
+    cleanupdelete) command_cleanupdelete;;
     version) command_version;;
     *) command_help; exit 1;;
   esac
