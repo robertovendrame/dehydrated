@@ -1,0 +1,7 @@
+# INFO: Using main config file /home/homeassistant/dehydrated/config
+Unknown hook this_hookscript_is_broken__dehydrated_is_working_fine__please_ignore_unknown_hooks_in_your_script
+Processing vendrame.duckdns.org
+Unknown hook this_hookscript_is_broken__dehydrated_is_working_fine__please_ignore_unknown_hooks_in_your_script
+ + Checking domain name(s) of existing cert... unchanged.
+ + Checking expire date of existing cert...
+ + Valid till May  7 23:02:15 2021 GMT (Longer than 30 days). Skipping renew!
